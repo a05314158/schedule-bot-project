@@ -1,0 +1,4 @@
+aiogram>=2.0,<3.0
+pandas
+openpyxl
+python-dotenv
