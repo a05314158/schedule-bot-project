@@ -123,5 +123,8 @@ def confirm_delete_task_kb(task_id: int):
     kb.add(InlineKeyboardButton("Нет (к инфо о задаче)", callback_data=f"{pref}:infocancel:{task_id}"))
     return kb
 
-def mark_feedback_viewed_kb(feedback_id: int):
-    kb = InlineKeyboardMarkup(row_width=1); kb.add(InlineKeyboardButton(f"✅ Отметить отзыв #{feedback_id} как прочитанный", callback_data=f"{CB_PREFIX_FEEDBACK}:markviewed:{feedback_id}")); return kb
+def mark_feedback_viewed_kb(feedback_id: int, user_id_from_feedback: int): # Добавляем user_id_from_feedback
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton(f"🗣️ Ответить на отзыв #{feedback_id}", callback_data=f"{CB_PREFIX_FEEDBACK}:reply:{feedback_id}:{user_id_from_feedback}"))
+    kb.add(InlineKeyboardButton(f"✅ Отметить отзыв #{feedback_id} как прочитанный", callback_data=f"{CB_PREFIX_FEEDBACK}:markviewed:{feedback_id}"))
+    return kb
