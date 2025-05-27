@@ -1,0 +1,23 @@
+# Virtualenv
+.venv/
+venv/
+ENV/
+env/
+*.pyc
+__pycache__/
+.env
+
+# Databases (если вы не хотите их версионировать)
+*.db
+*.sqlite3
+
+# Data files (если они большие или генерируются локально)
+data/uploads/
+data/generated_schedules/
+# data/generated_schedules_test/ # Если это тестовый вывод
+
+# IDE-specific
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
