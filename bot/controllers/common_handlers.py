@@ -1,162 +1,123 @@
 from aiogram import types, Dispatcher
 from aiogram.dispatcher.filters import CommandStart, Command, Text
 from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
-from aiogram.types import ReplyKeyboardRemove, BotCommand, ParseMode, InputFile, MediaGroup, ContentType
+from aiogram.dispatcher.filters.state import State, StatesGroup # <--- ИСПРАВЛЕНО
+from aiogram.types import ReplyKeyboardRemove, BotCommand, ParseMode
 from aiogram.utils.markdown import html_decoration as hd
 import os
 
 from bot.models import db
 from bot.views import messages, keyboards
-from bot.utils import file_manager
 from bot.config import ADMIN_IDS
-from bot.controllers import schedule_handlers, admin_handlers
+from bot.utils import file_manager # <--- ДОБАВЛЕНО
 
-class FeedbackState(StatesGroup):
-    waiting_for_feedback_message = State()
+try:
+    from .schedule_handlers import active_user_only
+except ImportError:
+    print("WARNING: active_user_only decorator not found in schedule_handlers, using a pass-through decorator in common_handlers.")
+    def active_user_only(func):
+        async def wrapper(*args, **kwargs): return await func(*args, **kwargs)
+        return wrapper
 
 async def cmd_start(message: types.Message, state: FSMContext, command: BotCommand = None):
     await state.finish()
     db.add_user(telegram_id=message.from_user.id, username=message.from_user.username, first_name=message.from_user.first_name)
     user_info = db.get_user(message.from_user.id)
     if not user_info: await message.answer(messages.ERROR_OCCURRED, reply_markup=ReplyKeyboardRemove()); return
+    user_telegram_id, user_username, user_first_name, user_status, user_role, user_created_at = user_info
     is_admin_user = message.from_user.id in ADMIN_IDS
-    user_status, user_role = user_info[3], user_info[4]
     if is_admin_user and (user_status != 'active' or user_role != 'admin'):
         db.update_user_status_role(message.from_user.id, status='active', role='admin')
         user_status, user_role = 'active', 'admin'
         await message.answer("👑 Вы автоматически активированы как администратор.")
-    await message.answer(f"{messages.WELCOME_MESSAGE}\nВаш ID: {message.from_user.id}", parse_mode=ParseMode.HTML)
+    await message.answer(f"{messages.WELCOME_MESSAGE}\nВаш ID: {message.from_user.id}")
     if user_status == 'pending': await message.answer(messages.ACCESS_PENDING_MESSAGE, reply_markup=ReplyKeyboardRemove())
     elif user_status == 'banned': await message.answer(messages.ACCESS_DENIED_MESSAGE, reply_markup=ReplyKeyboardRemove())
-    elif user_status == 'active': await message.answer("Выберите действие из меню:", reply_markup=keyboards.main_menu_kb(is_admin=is_admin_user))
+    elif user_status == 'active': await message.answer("Вы можете создавать расписания или получить помощь.", reply_markup=keyboards.main_menu_kb(is_admin=is_admin_user))
 
+async def cmd_help(message: types.Message, command: BotCommand = None):
+    user_info = db.get_user(message.from_user.id)
+    is_admin = user_info and user_info[4] == 'admin' and message.from_user.id in ADMIN_IDS
+    help_text = messages.ADMIN_HELP_MESSAGE if is_admin else messages.USER_HELP_MESSAGE
+    try: await message.answer(help_text, parse_mode=ParseMode.HTML)
+    except Exception: await message.answer(help_text)
+    if user_info and user_info[3] == 'active': await message.answer("Выберите действие:", reply_markup=keyboards.main_menu_kb(is_admin=is_admin))
 
-async def cmd_help_wrapper(message: types.Message, command: BotCommand = None, state: FSMContext = None):
-    user_id = message.from_user.id
-    is_admin_user = user_id in ADMIN_IDS
-
-    help_text_to_send = messages.ADMIN_HELP_MESSAGE if is_admin_user else messages.USER_HELP_MESSAGE
-
-    try:
-        await message.answer(help_text_to_send, parse_mode=ParseMode.HTML)
-    except Exception:
-        # В случае ошибки парсинга HTML, отправляем как простой текст (убрав теги)
-        # Это очень грубый способ убрать теги, лучше иметь версии без тегов
-        plain_text_help = help_text_to_send.replace("<br>", "\n").replace("<b>", "").replace("</b>", "").replace(
-            "<code>", "").replace("</code>", "").replace("<i>", "").replace("</i>", "")
-        plain_text_help = plain_text_help.replace("<", "<").replace(">", ">")
-        await message.answer(plain_text_help)
-
-    user_info = db.get_user(user_id)  # Повторно получаем, т.к. is_admin_user уже есть
-    if user_info and user_info[3] == 'active':
-        await message.answer("Что бы вы хотели сделать дальше?",
-                             reply_markup=keyboards.main_menu_kb(is_admin=is_admin_user))
-async def cmd_cancel_wrapper(message: types.Message, state: FSMContext, command: BotCommand = None):
-    user_id = message.from_user.id; current_fsm_state_name = await state.get_state()
-    is_admin_user = user_id in ADMIN_IDS
-    await state.finish(); reply_markup_after_cancel = ReplyKeyboardRemove()
-    user_info = db.get_user(user_id)
-    if user_info and user_info[3] == 'active': reply_markup_after_cancel = keyboards.main_menu_kb(is_admin=is_admin_user)
-    if current_fsm_state_name == FeedbackState.waiting_for_feedback_message.state:
-        await message.answer(messages.CANCELLED_ACTION_GENERIC, reply_markup=reply_markup_after_cancel); return
-    active_task_id = db.get_task_id_by_user_and_status(user_id, ['pending_groups_file', 'pending_weekdays_file', 'pending_files'])
-    if active_task_id:
-        if db.cancel_task_by_id(active_task_id):
-            file_manager.cleanup_task_files(user_id, active_task_id)
-            await message.answer(messages.CANCELLED_TASK_SUCCESS.format(task_id=active_task_id), reply_markup=reply_markup_after_cancel); return
-        else: await message.answer(messages.CANCELLED_TASK_FAILED, reply_markup=reply_markup_after_cancel); return
-    elif current_fsm_state_name is not None: await message.answer(messages.CANCELLED_ACTION, reply_markup=reply_markup_after_cancel); return
-    else: await message.answer(messages.NO_ACTIVE_TASK_TO_CANCEL, reply_markup=reply_markup_after_cancel); return
-
-async def cmd_task_status_wrapper(message: types.Message, command: BotCommand = None, state: FSMContext = None):
-    user_id = message.from_user.id; args = message.get_args() if command else None
-    task_id_to_check = None
-    is_admin_user = user_id in ADMIN_IDS
-    if args:
-        try: task_id_to_check = int(args)
-        except ValueError: await message.reply(messages.TASK_STATUS_USAGE, parse_mode=ParseMode.HTML); return
-    else:
-        task_id_to_check = db.get_user_last_task_id(user_id)
-        if not task_id_to_check: await message.answer(messages.TASK_STATUS_NO_TASK_FOR_USER, reply_markup=keyboards.main_menu_kb(is_admin=is_admin_user), parse_mode=ParseMode.HTML); return
-    task_details = db.get_full_task_details(task_id_to_check)
-    if not task_details: await message.answer(messages.TASK_STATUS_ID_NOT_FOUND.format(task_id=task_id_to_check), reply_markup=keyboards.main_menu_kb(is_admin=is_admin_user)); return
-    if task_details[1] != user_id and not is_admin_user:
-         await message.answer(messages.TASK_STATUS_ID_NOT_FOUND.format(task_id=task_id_to_check) + " (Это не ваша задача)", reply_markup=keyboards.main_menu_kb(is_admin=is_admin_user)); return
-    (t_id,db_uid,un,fn,gf,wf,st,ca,rm)=task_details;ud=fn or un or f"ID:{db_uid}";gfb=os.path.basename(gf) if gf and isinstance(gf,str) else"N/A";wfb=os.path.basename(wf) if wf and isinstance(wf,str) else "N/A"
-    resp=messages.TASK_STATUS_INFO_HEADER.format(task_id=t_id)+messages.TASK_STATUS_ITEM.format(user_display=hd.quote(ud),user_id=db_uid,created_at=ca,status=hd.quote(st),groups_file=hd.quote(gfb),weekdays_file=hd.quote(wfb),result_message=hd.quote(rm if rm else"Нет информации."))
-    odf=file_manager.get_output_dir_for_task(db_uid,t_id); re=os.path.exists(odf) and any(f.endswith(('.xlsx','.xls')) for f in os.listdir(odf))
-    rmu=keyboards.task_status_actions_kb(t_id,st,re)
-    await message.answer(resp,parse_mode=ParseMode.HTML,reply_markup=rmu if rmu.inline_keyboard else None)
-
-async def callback_resend_results(call: types.CallbackQuery, state: FSMContext = None):
-    try: task_id = int(call.data.split("_")[-1])
-    except: await call.answer("Ошибка ID.", show_alert=True); return
-    td = db.get_full_task_details(task_id)
-    if not td: await call.answer(messages.TASK_STATUS_ID_NOT_FOUND.format(task_id=task_id),show_alert=True); return
-    is_admin_user = call.from_user.id in ADMIN_IDS
-    if td[1]!=call.from_user.id and not is_admin_user: await call.answer("Это не ваша задача.",show_alert=True); return
-    uid_owner=td[1]; odf=file_manager.get_output_dir_for_task(uid_owner,task_id); gfp=[]
-    if os.path.exists(odf):
-        for fn in sorted(os.listdir(odf)):
-            if fn.endswith(('.xlsx','.xls')): gfp.append(os.path.join(odf,fn))
-    if gfp:
-        await call.message.answer(f"Повторно отправляю результаты для Задачи #{task_id}:")
-        media=MediaGroup(); saf=False
-        for i,fp in enumerate(gfp):
-            if os.path.exists(fp) and len(media.media)<10: media.attach_document(InputFile(fp,filename=f"task{task_id}_{os.path.basename(fp)}")); saf=True
-            elif os.path.exists(fp) and len(media.media)==10:
-                try: await call.bot.send_media_group(chat_id=call.from_user.id,media=media)
-                except: pass
-                media=MediaGroup(); media.attach_document(InputFile(fp,filename=f"task{task_id}_{os.path.basename(fp)}"))
-        if media.media:
-            try: await call.bot.send_media_group(chat_id=call.from_user.id,media=media)
-            except Exception as e: await call.message.answer(messages.FILES_SEND_ERROR.format(task_id=task_id,error=hd.quote(str(e))),parse_mode=ParseMode.HTML)
-        if not saf and gfp: await call.message.answer(messages.NO_FILES_TO_SEND_WARNING.format(task_id=task_id))
-        await call.answer()
-    else: await call.answer("Сгенерированные файлы не найдены.",show_alert=True)
-
-async def cmd_feedback_wrapper(message: types.Message, state: FSMContext, command: BotCommand = None):
-    feedback_text = message.get_args() if command else None
-    is_admin_user = message.from_user.id in ADMIN_IDS
-    if command and feedback_text:
-        db.save_feedback(message.from_user.id, message.from_user.username, message.from_user.first_name, feedback_text)
-        await message.reply(messages.FEEDBACK_RECEIVED, reply_markup=keyboards.main_menu_kb(is_admin=is_admin_user))
-        for admin_id in ADMIN_IDS:
-            if admin_id == message.from_user.id : continue
-            try: await message.bot.send_message(admin_id, messages.FEEDBACK_FORWARDED_TO_ADMIN.format(user_display=hd.quote(message.from_user.full_name), user_id=message.from_user.id, feedback_text=hd.quote(feedback_text), feedback_id="Новый (через команду)"), parse_mode=ParseMode.HTML)
-            except Exception: pass
-    else:
-        await FeedbackState.waiting_for_feedback_message.set()
-        await message.reply(messages.FEEDBACK_PROMPT, reply_markup=keyboards.cancel_state_kb(), parse_mode=ParseMode.HTML)
-
-async def process_feedback_message(message: types.Message, state: FSMContext):
-    is_admin_user = message.from_user.id in ADMIN_IDS
-    if not message.text or message.text.startswith('/'):
-        await message.reply(messages.FEEDBACK_EMPTY, reply_markup=keyboards.cancel_state_kb(), parse_mode=ParseMode.HTML); return
-    feedback_text = message.text
-    db.save_feedback(message.from_user.id, message.from_user.username, message.from_user.first_name, feedback_text)
+async def cmd_cancel(message: types.Message, state: FSMContext, command: BotCommand = None):
+    current_state = await state.get_state()
+    user_info = db.get_user(message.from_user.id)
+    is_admin = user_info and user_info[4] == 'admin' and message.from_user.id in ADMIN_IDS
+    reply_markup_after_cancel = ReplyKeyboardRemove()
+    if user_info and user_info[3] == 'active': reply_markup_after_cancel = keyboards.main_menu_kb(is_admin=is_admin)
+    if current_state is None:
+        active_fsm_independent_task = db.get_user_active_task(message.from_user.id)
+        if active_fsm_independent_task:
+            task_to_cancel_id = active_fsm_independent_task[0]
+            await message.answer(messages.CANCELLED_ACTION_GENERIC, reply_markup=reply_markup_after_cancel)
+            return
+        await message.answer(messages.NO_ACTIVE_TASK_TO_CANCEL, reply_markup=reply_markup_after_cancel)
+        return
     await state.finish()
-    await message.reply(messages.FEEDBACK_RECEIVED, reply_markup=keyboards.main_menu_kb(is_admin=is_admin_user))
-    for admin_id in ADMIN_IDS:
-        if admin_id == message.from_user.id : continue
-        try: await message.bot.send_message(admin_id, messages.FEEDBACK_FORWARDED_TO_ADMIN.format(user_display=hd.quote(message.from_user.full_name), user_id=message.from_user.id, feedback_text=hd.quote(feedback_text), feedback_id="Новый (через FSM)"), parse_mode=ParseMode.HTML)
-        except Exception: pass
+    await message.answer(messages.CANCELLED_ACTION, reply_markup=reply_markup_after_cancel)
 
-async def text_admin_panel_handler(message: types.Message, state: FSMContext):
-    # Проверка прав теперь будет в admin_handlers.cmd_admin_panel через декоратор @admin_only
-    await admin_handlers.cmd_admin_panel(message, state=state) # Передаем и message, и state
+@active_user_only
+async def cmd_my_task_status(message: types.Message, state: FSMContext, command: types.BotCommand = None, **kwargs):
+    await state.finish()
+    user_id = message.from_user.id; args = message.get_args(); task_id_to_show = None
+    if args and args.isdigit(): task_id_to_show = int(args)
+    else: last_task_id = db.get_user_last_task_id(user_id); task_id_to_show = last_task_id
+    is_admin_user = message.from_user.id in ADMIN_IDS
+    if not task_id_to_show: await message.answer(messages.TASK_STATUS_NO_TASK_FOR_USER, reply_markup=keyboards.main_menu_kb(is_admin=is_admin_user)); return
+    task_details = db.get_full_task_details(task_id_to_show)
+    if not task_details or (task_details[1] != user_id and not is_admin_user):
+        await message.answer(messages.TASK_STATUS_ID_NOT_FOUND.format(task_id=task_id_to_show), reply_markup=keyboards.main_menu_kb(is_admin=is_admin_user)); return
+    t_id, uid_db, un_db, fn_db, gf_path, wf_path, st, ca_str, rm_str = task_details
+    user_display = hd.quote(fn_db or un_db or f"ID:{uid_db}")
+    groups_file_name = os.path.basename(gf_path) if gf_path and isinstance(gf_path, str) else "не загружен"
+    weekdays_file_name = os.path.basename(wf_path) if wf_path and isinstance(wf_path, str) else "не загружен"
+    result_message_display = hd.quote(rm_str or "Информация отсутствует.")
+    response_text = messages.TASK_STATUS_INFO_HEADER.format(task_id=t_id)
+    response_text += messages.TASK_STATUS_ITEM.format(user_display=user_display, user_id=uid_db, created_at=ca_str or "N/A", status=hd.quote(st), groups_file=hd.quote(groups_file_name), weekdays_file=hd.quote(weekdays_file_name), result_message=result_message_display)
+    output_dir_for_task = file_manager.get_output_dir_for_task(uid_db, t_id)
+    results_are_present = False
+    if os.path.exists(output_dir_for_task) and any(f.endswith(('.xlsx', '.xls')) for f in os.listdir(output_dir_for_task)): results_are_present = True
+    reply_markup = keyboards.task_info_actions_kb(task_id=t_id, task_status=st, results_exist=results_are_present, user_id=uid_db if is_admin_user else None)
+    await message.answer(response_text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+
+class FeedbackStates(StatesGroup):
+    waiting_for_feedback_text = State()
+
+@active_user_only
+async def cmd_leave_feedback_start(message: types.Message, state: FSMContext, command: types.BotCommand = None, **kwargs):
+    await state.set_state(FeedbackStates.waiting_for_feedback_text.state)
+    await message.answer(messages.FEEDBACK_PROMPT, reply_markup=keyboards.cancel_state_kb())
+
+async def process_feedback_text(message: types.Message, state: FSMContext):
+    if not message.text or len(message.text.strip()) < 5:
+        await message.reply(messages.FEEDBACK_EMPTY, reply_markup=keyboards.cancel_state_kb()); return
+    user_id = message.from_user.id; user_info = db.get_user(user_id)
+    username = user_info[1] if user_info else message.from_user.username
+    first_name = user_info[2] if user_info else message.from_user.first_name
+    is_admin = user_id in ADMIN_IDS
+    if db.save_feedback(user_id, username, first_name, message.text.strip()):
+        await message.answer(messages.FEEDBACK_RECEIVED, reply_markup=keyboards.main_menu_kb(is_admin=is_admin))
+        feedback_id = db.get_last_feedback_id_for_user(user_id)
+        if feedback_id:
+            user_display = hd.quote(first_name or username or f"ID:{user_id}")
+            for admin_id_notify in ADMIN_IDS:
+                try: await message.bot.send_message(admin_id_notify, messages.FEEDBACK_FORWARDED_TO_ADMIN.format(user_display=user_display, user_id=user_id, feedback_text=hd.quote(message.text.strip()), feedback_id=feedback_id), parse_mode=ParseMode.HTML)
+                except Exception: pass
+    else: await message.answer(messages.ERROR_OCCURRED + " (не удалось сохранить отзыв)", reply_markup=keyboards.main_menu_kb(is_admin=is_admin))
+    await state.finish()
 
 def register_common_handlers(dp: Dispatcher):
     dp.register_message_handler(cmd_start, CommandStart(), state="*")
-    dp.register_message_handler(cmd_help_wrapper, Command(commands=['help']), state="*")
-    dp.register_message_handler(cmd_help_wrapper, Text(equals="❓ Помощь", ignore_case=True), state="*")
-    dp.register_message_handler(cmd_cancel_wrapper, Command(commands=['cancel']), state="*")
-    dp.register_message_handler(cmd_cancel_wrapper, Text(equals="❌ Отменить текущее", ignore_case=True), state="*")
-    dp.register_message_handler(cmd_task_status_wrapper, Command(commands=['task_status']), state="*")
-    dp.register_message_handler(cmd_task_status_wrapper, Text(equals="📊 Статус моей задачи", ignore_case=True), state="*")
-    dp.register_callback_query_handler(callback_resend_results, Text(startswith="resend_results_"), state="*")
-    dp.register_message_handler(cmd_feedback_wrapper, Command(commands=['feedback']), state="*")
-    dp.register_message_handler(cmd_feedback_wrapper, Text(equals="📝 Оставить отзыв", ignore_case=True), state="*")
-    dp.register_message_handler(process_feedback_message, state=FeedbackState.waiting_for_feedback_message, content_types=ContentType.TEXT)
-    dp.register_message_handler(text_admin_panel_handler, Text(equals="👑 Админ-панель", ignore_case=True), state="*")
+    dp.register_message_handler(cmd_help, Command(commands=['help']), state="*")
+    dp.register_message_handler(cmd_help, Text(equals="❓ Помощь", ignore_case=True), state="*")
+    dp.register_message_handler(cmd_cancel, Command(commands=['cancel']), state="*")
+    dp.register_message_handler(cmd_cancel, Text(equals="❌ Отменить текущее", ignore_case=True), state="*")
+    dp.register_message_handler(cmd_my_task_status, Command(commands=['my_task_status', 'task_status']), state="*")
+    dp.register_message_handler(cmd_my_task_status, Text(equals="📊 Статус моей задачи", ignore_case=True), state="*")
+    dp.register_message_handler(cmd_leave_feedback_start, Command(commands=['feedback', 'leave_feedback']), state="*")
+    dp.register_message_handler(cmd_leave_feedback_start, Text(equals="📝 Оставить отзыв", ignore_case=True), state="*")
+    dp.register_message_handler(process_feedback_text, state=FeedbackStates.waiting_for_feedback_text, content_types=types.ContentType.TEXT)
